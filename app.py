@@ -4,7 +4,11 @@ from functools import wraps
 from io import BytesIO
 from logging.config import dictConfig
 import datetime
+from typing import Optional
+import re
+
 from dateutil.relativedelta import relativedelta
+from collections import defaultdict
 
 from flask import Flask, url_for, render_template, session, redirect, json, send_file
 from flask_oauthlib.contrib.client import OAuth, OAuth2Application
@@ -64,6 +68,11 @@ api_client = ApiClient(
     ),
     pool_threads=1,
 )
+
+_name_match_res = [
+    re.compile('(?P<name>[^\/]+) \/[^\(]+\((?P<email_address>[^)]+)\).*'),
+    re.compile('(?P<name>[^\/(]+) \((?P<email_address>[^)]+)\).*')
+]
 
 
 # configure token persistence and exchange point between flask-oauthlib and xero-python
@@ -215,7 +224,7 @@ def get_invoices():
     accounting_api = AccountingApi(api_client)
 
     invoices = accounting_api.get_invoices(
-        xero_tenant_id, statuses=["DRAFT", "SUBMITTED"]
+        xero_tenant_id, statuses=["DRAFT", "SUBMITTED","AUTHORISED"]
     )
     code = serialize_model(invoices)
     sub_title = "Total invoices found: {}".format(len(invoices.invoices))
@@ -301,28 +310,51 @@ def journals_list():
 def members_list():
     xero_tenant_id = get_xero_tenant_id()
     accounting_api = AccountingApi(api_client)
-    journals = accounting_api.get_journals(
-        xero_tenant_id=xero_tenant_id,
-        if_modified_since=datetime.datetime.now() - relativedelta(days=90)
-    )
 
-    relevant_accounts = []
-    accounts = accounting_api.get_accounts(xero_tenant_id)
+    sources = defaultdict(list)
+    member_transactions = defaultdict(list)
 
-    for account in accounts.accounts:
-        if 'Membership' in account.name:
-            relevant_accounts.append(account)
+    # Walk the full journal for the past 90 days for membership items
+    # and split them based on which type they are, i.e. 'CASHREC' / 'ACCREC'
 
-    membership_journal_lines = []
-    for journal in journals.journals:
-        for line in journal.journal_lines:
-            if line.account_code in [a.code for a in relevant_accounts]:
-                membership_journal_lines.append(line)
+    for journal in get_journals(datetime.datetime.now() - relativedelta(days=90)):
+        if is_membership_journal(journal):
+            sources[journal.source_type].append(journal.source_id)
+
+    transactions = []
+    for source, source_ids in sources.items():
+
+        if source == 'CASHREC':
+            for s in source_ids:
+                transactions.extend(
+                    # get_bank_transactions has to be done individually but there's usually not many of them
+                    accounting_api.get_bank_transaction(xero_tenant_id, s).bank_transactions
+                )
+        elif source == 'ACCREC':
+            transactions.extend(
+                accounting_api.get_invoices(xero_tenant_id, i_ds=source_ids).invoices
+            )
+        else:
+            raise ValueError(source)
+
+    for transaction in transactions:
+        c = transaction.contact.contact_id
+        member_transactions[c].append(transaction)
+
+    members = accounting_api.get_contacts(xero_tenant_id, i_ds=list(member_transactions.keys())).contacts
+    contact_sheet = []
+    for m in members:
+        contact_sheet.append(
+            {
+                **fix_contact(m),
+                'transactions': len(member_transactions[m.contact_id])
+            }
+        )
 
     return render_template(
         "code.html",
         title="Members",
-        code=serialize_model(membership_journal_lines),
+        code=serialize_model(contact_sheet),
         sub_title="For Past 90 days",
     )
 
@@ -336,6 +368,74 @@ def get_xero_tenant_id():
     for connection in identity_api.get_connections():
         if connection.tenant_type == "ORGANISATION":
             return connection.tenant_id
+
+def get_journals(since:Optional[datetime.datetime]=None):
+    if since is None:
+        since = datetime.datetime.now() - relativedelta(days=90)
+    xero_tenant_id = get_xero_tenant_id()
+    accounting_api = AccountingApi(api_client)
+    these = accounting_api.get_journals(
+        xero_tenant_id=xero_tenant_id,
+        if_modified_since=since
+    )
+    while these and these.journals:
+        yield from these.journals
+        offset = these.journals[-1].journal_number
+        these = accounting_api.get_journals(
+            xero_tenant_id=xero_tenant_id,
+            if_modified_since=since,
+            offset=offset
+        )
+
+def is_membership_journal(journal):
+    for line in journal.journal_lines:
+        if line.account_code == '200':
+            return True
+    return False
+
+def _unNone(v):
+    # `serializer` is an idiot and can't serialise Nones...
+    if isinstance(v,dict):
+        return {k:_unNone(_v) for k,_v in v.items()}
+    else:
+        return '' if v is None else v
+
+def capitalize_nth(s, n):
+    return s[:n] + s[n:].capitalize()
+
+def fix_contact(contact):
+    p = None
+    if not contact.email_address:
+        for res in _name_match_res:
+            m = res.match(contact.name)
+            if m is not None:
+                p=m.groupdict()
+                break
+
+        # Nothing Matched, fallback
+        if p is None:
+            p = dict(
+                name=contact.name
+            )
+    else:
+        p = dict(
+            name=contact.name,
+            first_name=contact.first_name,
+            last_name=contact.last_name,
+            email_address=contact.email_address
+        )
+
+    p['name'] = p['name'].title()
+    p['email_address'] = p['email_address'].lower() if 'email_address' in p else None
+    try:
+        p['first_name'], p['last_name'] = p['name'].split(maxsplit=1)
+        if p.get('last_name','').startswith('Mc'):
+            p['last_name'] = capitalize_nth(p['last_name'],2)
+    except (ValueError, KeyError):
+        p['first_name'] = p['name']
+        p['last_name'] = None
+
+    return _unNone(p)
 
 
 if __name__ == "__main__":

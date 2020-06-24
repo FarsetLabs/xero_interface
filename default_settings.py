@@ -9,3 +9,4 @@ SESSION_FILE_DIR = join(dirname(__file__), "cache")
 
 # configure flask app for local development
 ENV = "development"
+DEBUG=True
