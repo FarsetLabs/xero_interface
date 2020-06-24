@@ -3,6 +3,8 @@ import os
 from functools import wraps
 from io import BytesIO
 from logging.config import dictConfig
+import datetime
+from dateutil.relativedelta import relativedelta
 
 from flask import Flask, url_for, render_template, session, redirect, json, send_file
 from flask_oauthlib.contrib.client import OAuth, OAuth2Application
@@ -274,6 +276,54 @@ def refresh_token():
         title="Xero OAuth2 token",
         code=jsonify({"Old Token": xero_token, "New token": new_token}),
         sub_title="token refreshed",
+    )
+
+
+@app.route("/journals-list")
+@xero_token_required
+def journals_list():
+    xero_tenant_id = get_xero_tenant_id()
+    accounting_api = AccountingApi(api_client)
+    journals = accounting_api.get_journals(
+        xero_tenant_id=xero_tenant_id,
+        if_modified_since=datetime.datetime.now() - relativedelta(days=90)
+    )
+
+    return render_template(
+        "code.html",
+        title="Journals",
+        code=serialize_model(journals),
+        sub_title="For Past 90 days",
+    )
+
+@app.route("/members-list")
+@xero_token_required
+def members_list():
+    xero_tenant_id = get_xero_tenant_id()
+    accounting_api = AccountingApi(api_client)
+    journals = accounting_api.get_journals(
+        xero_tenant_id=xero_tenant_id,
+        if_modified_since=datetime.datetime.now() - relativedelta(days=90)
+    )
+
+    relevant_accounts = []
+    accounts = accounting_api.get_accounts(xero_tenant_id)
+
+    for account in accounts.accounts:
+        if 'Membership' in account.name:
+            relevant_accounts.append(account)
+
+    membership_journal_lines = []
+    for journal in journals.journals:
+        for line in journal.journal_lines:
+            if line.account_code in [a.code for a in relevant_accounts]:
+                membership_journal_lines.append(line)
+
+    return render_template(
+        "code.html",
+        title="Members",
+        code=serialize_model(membership_journal_lines),
+        sub_title="For Past 90 days",
     )
 
 
